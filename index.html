@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>BLE → Drive Logger</title>
+<style>
+  :root { --bg:#0f1115; --card:#181b22; --line:#2a2f3a; --text:#e8eaf0; --mut:#98a0b3; --acc:#4f8cff; --ok:#3ecf8e; --bad:#ff6b6b; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.4 -apple-system, system-ui, sans-serif; padding:16px; padding-bottom:40px; }
+  h1 { font-size:20px; margin:0 0 12px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; margin-bottom:14px; }
+  label { display:block; font-size:12px; color:var(--mut); margin:10px 0 4px; }
+  input { width:100%; padding:10px; border-radius:8px; border:1px solid var(--line); background:#0f1115; color:var(--text); font-size:15px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; }
+  button { flex:1; min-width:120px; padding:12px; border:0; border-radius:10px; background:var(--acc); color:#fff; font-size:15px; font-weight:600; }
+  button.sec { background:#2a2f3a; }
+  button:disabled { opacity:.4; }
+  .stat { display:flex; justify-content:space-between; padding:4px 0; font-size:14px; }
+  .stat span:last-child { font-variant-numeric:tabular-nums; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); }
+  #log { font:12px/1.4 ui-monospace, Menlo, monospace; color:var(--mut); max-height:220px; overflow:auto; white-space:pre-wrap; }
+  #last { font:22px ui-monospace, Menlo, monospace; word-break:break-all; }
+  details summary { cursor:pointer; font-weight:600; }
+</style>
+</head>
+<body>
+<h1>BLE → Google Drive Logger</h1>
+
+<div class="card">
+  <div class="stat"><span>Bluetooth</span><span id="bleState" class="bad">disconnected</span></div>
+  <div class="stat"><span>Samples buffered</span><span id="buffered">0</span></div>
+  <div class="stat"><span>Samples uploaded</span><span id="uploaded">0</span></div>
+  <div class="stat"><span>Last upload</span><span id="lastUp">—</span></div>
+  <label>Latest value</label>
+  <div id="last">—</div>
+</div>
+
+<div class="card">
+  <div class="row">
+    <button id="btnConnect">Connect ESP32</button>
+    <button id="btnSim" class="sec">Simulate data</button>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <button id="btnFlush" class="sec">Upload now</button>
+    <button id="btnCsv" class="sec">Download CSV</button>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <button id="btnStop" class="sec" disabled>Disconnect / Stop</button>
+  </div>
+</div>
+
+<div class="card">
+  <details open>
+    <summary>Settings</summary>
+    <label>Google Apps Script Web App URL (ends in /exec)</label>
+    <input id="url" placeholder="https://script.google.com/macros/s/.../exec" autocapitalize="off" autocorrect="off">
+    <label>Shared secret (must match SECRET in Code.gs)</label>
+    <input id="secret" placeholder="change-me" autocapitalize="off" autocorrect="off">
+    <label>BLE service UUID</label>
+    <input id="svc" autocapitalize="off" autocorrect="off">
+    <label>BLE characteristic UUID (notify)</label>
+    <input id="chr" autocapitalize="off" autocorrect="off">
+    <label>Upload every (seconds)</label>
+    <input id="every" type="number" min="1" value="5">
+  </details>
+</div>
+
+<div class="card"><div id="log"></div></div>
+
+<script>
+(() => {
+  'use strict';
+  const $ = id => document.getElementById(id);
+  const DEFAULTS = {
+    url: '', secret: 'change-me',
+    svc: '4fafc201-1fb5-459e-8fcc-c5c9c331914b',
+    chr: 'beb5483e-36e1-4688-b7f5-ea07361b26a8',
+    every: '5'
+  };
+  const store = {
+    get(k){ try { return localStorage.getItem('bdl_'+k) ?? DEFAULTS[k]; } catch { return DEFAULTS[k]; } },
+    set(k,v){ try { localStorage.setItem('bdl_'+k, v); } catch {} }
+  };
+  for (const k of Object.keys(DEFAULTS)) {
+    const el = $(k); el.value = store.get(k);
+    el.addEventListener('change', () => store.set(k, el.value.trim()));
+  }
+
+  const session = new Date().toISOString().replace(/[:.]/g,'-');
+  let buffer = [];       // samples waiting to upload
+  let all = [];          // everything this session (for CSV export)
+  let uploaded = 0, inflight = false, timer = null, simTimer = null;
+  let device = null, chrObj = null;
+
+  function log(msg) {
+    const t = new Date().toLocaleTimeString();
+    $('log').textContent = `[${t}] ${msg}\n` + $('log').textContent.slice(0, 4000);
+  }
+  function refresh() {
+    $('buffered').textContent = buffer.length;
+    $('uploaded').textContent = uploaded;
+  }
+  function setBle(text, ok) {
+    $('bleState').textContent = text;
+    $('bleState').className = ok ? 'ok' : 'bad';
+  }
+
+  // ---- sample intake -------------------------------------------------------
+  function addSample(raw, value) {
+    const s = { t: new Date().toISOString(), v: value, raw };
+    buffer.push(s); all.push(s);
+    $('last').textContent = String(raw);
+    refresh();
+  }
+
+  // Decode a BLE notification. Text ("23.5" or "a,b,c") is the common case from
+  // NimBLE-Arduino setValue(String). Falls back to hex for binary payloads.
+  function decode(dv) {
+    const bytes = new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
+    let text = '';
+    try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes); } catch {}
+    if (text && /^[\x20-\x7E\r\n\t]+$/.test(text)) {
+      const clean = text.trim();
+      const num = Number(clean);
+      return { raw: clean, value: Number.isFinite(num) ? num : '' };
+    }
+    const hex = Array.from(bytes, b => b.toString(16).padStart(2,'0')).join('');
+    let value = '';
+    if (bytes.length === 4) value = dv.getFloat32(0, true);
+    else if (bytes.length === 2) value = dv.getInt16(0, true);
+    return { raw: '0x'+hex, value };
+  }
+
+  // ---- Bluetooth -----------------------------------------------------------
+  async function connect() {
+    if (!navigator.bluetooth) {
+      log('Web Bluetooth not available. Open this page in the Bluefy browser.');
+      alert('Web Bluetooth not available. Open this page in the Bluefy app (not Safari).');
+      return;
+    }
+    const svc = $('svc').value.trim().toLowerCase();
+    const chr = $('chr').value.trim().toLowerCase();
+    try {
+      setBle('scanning…', false);
+      device = await navigator.bluetooth.requestDevice({
+        acceptAllDevices: true,
+        optionalServices: [svc]
+      });
+      device.addEventListener('gattserverdisconnected', () => {
+        setBle('disconnected', false); log('BLE disconnected'); $('btnStop').disabled = true;
+      });
+      setBle('connecting…', false);
+      const server = await device.gatt.connect();
+      const service = await server.getPrimaryService(svc);
+      chrObj = await service.getCharacteristic(chr);
+      chrObj.addEventListener('characteristicvaluechanged', e => {
+        const d = decode(e.target.value);
+        addSample(d.raw, d.value);
+      });
+      await chrObj.startNotifications();
+      setBle('connected: ' + (device.name || 'device'), true);
+      $('btnStop').disabled = false;
+      log('Subscribed to notifications');
+      startUploader();
+    } catch (err) {
+      setBle('disconnected', false);
+      log('BLE error: ' + err.message);
+    }
+  }
+
+  // ---- simulated data (to test the Drive path without hardware) ------------
+  function toggleSim() {
+    if (simTimer) { clearInterval(simTimer); simTimer = null; $('btnSim').textContent = 'Simulate data'; log('Simulation stopped'); return; }
+    let i = 0;
+    simTimer = setInterval(() => {
+      const v = (25 + 5 * Math.sin(i / 10) + (Math.random() - .5)).toFixed(2);
+      addSample(v, Number(v)); i++;
+    }, 100);
+    $('btnSim').textContent = 'Stop simulation';
+    $('btnStop').disabled = false;
+    log('Simulating 10 samples/sec');
+    startUploader();
+  }
+
+  function stopAll() {
+    if (simTimer) toggleSim();
+    if (device && device.gatt.connected) device.gatt.disconnect();
+    flush();
+    $('btnStop').disabled = true;
+  }
+
+  // ---- upload to Google Drive via Apps Script ------------------------------
+  function startUploader() {
+    if (timer) clearInterval(timer);
+    const secs = Math.max(1, parseInt($('every').value, 10) || 5);
+    timer = setInterval(flush, secs * 1000);
+  }
+
+  async function flush() {
+    if (inflight || buffer.length === 0) return;
+    const url = $('url').value.trim();
+    if (!url) { log('Set the Apps Script URL in Settings first.'); return; }
+    inflight = true;
+    const batch = buffer.splice(0, 500);          // cap batch size
+    const batchId = session + '-' + Date.now() + '-' + Math.random().toString(36).slice(2,8);
+    refresh();
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // simple request: no CORS preflight
+        body: JSON.stringify({ secret: $('secret').value.trim(), session, batchId, rows: batch })
+      });
+      const out = await res.json();
+      if (!out.ok) throw new Error(out.error || 'server rejected batch');
+      uploaded += batch.length;
+      $('lastUp').textContent = new Date().toLocaleTimeString();
+      log(`Uploaded ${batch.length} samples${out.duplicate ? ' (duplicate ignored)' : ''}`);
+    } catch (err) {
+      buffer = batch.concat(buffer);               // put back, retry next tick
+      log('Upload failed, will retry: ' + err.message);
+    } finally {
+      inflight = false; refresh();
+    }
+  }
+
+  // ---- CSV fallback --------------------------------------------------------
+  function downloadCsv() {
+    const rows = ['timestamp,value,raw'].concat(all.map(s => `${s.t},${s.v},"${String(s.raw).replace(/"/g,'""')}"`));
+    const blob = new Blob([rows.join('\n')], { type: 'text/csv' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = `ble-data-${session}.csv`;
+    document.body.appendChild(a); a.click(); a.remove();
+  }
+
+  $('btnConnect').onclick = connect;
+  $('btnSim').onclick = toggleSim;
+  $('btnFlush').onclick = flush;
+  $('btnCsv').onclick = downloadCsv;
+  $('btnStop').onclick = stopAll;
+  $('every').addEventListener('change', startUploader);
+  window.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flush(); });
+  log('Ready. Session ' + session);
+})();
+</script>
+</body>
+</html>
