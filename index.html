@@ -107,15 +107,17 @@
   }
 
   // ---- sample intake -------------------------------------------------------
-  function addSample(raw, value) {
+  function addSample(raw, value, label) {
     const s = { t: new Date().toISOString(), v: value, raw };
     buffer.push(s); all.push(s);
-    $('last').textContent = String(raw);
+    $('last').textContent = label ?? String(raw);
     refresh();
   }
 
   // Decode a BLE notification. Text ("23.5" or "a,b,c") is the common case from
-  // NimBLE-Arduino setValue(String). Falls back to hex for binary payloads.
+  // NimBLE-Arduino setValue(String). Binary payloads are decoded as numbers:
+  //   8 bytes = uint32 packet count + float32 value (esp32_server.ino), little-endian
+  //   4 bytes = float32, 2 bytes = int16. Anything else shows as hex.
   function decode(dv) {
     const bytes = new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
     let text = '';
@@ -126,10 +128,22 @@
       return { raw: clean, value: Number.isFinite(num) ? num : '' };
     }
     const hex = Array.from(bytes, b => b.toString(16).padStart(2,'0')).join('');
-    let value = '';
-    if (bytes.length === 4) value = dv.getFloat32(0, true);
-    else if (bytes.length === 2) value = dv.getInt16(0, true);
-    return { raw: '0x'+hex, value };
+    let value = '', label;
+    if (bytes.length === 8) {
+      const count = dv.getUint32(0, true);
+      const f = dv.getFloat32(4, true);
+      if (Number.isFinite(f)) {
+        value = Number(f.toPrecision(7));        // drop float32 -> double noise
+        label = `${value}   (packet #${count})`;
+      }
+    } else if (bytes.length === 4) {
+      const f = dv.getFloat32(0, true);
+      if (Number.isFinite(f)) value = Number(f.toPrecision(7));
+    } else if (bytes.length === 2) {
+      value = dv.getInt16(0, true);
+    }
+    if (label === undefined && value !== '') label = String(value);
+    return { raw: '0x'+hex, value, label };
   }
 
   // ---- Bluetooth -----------------------------------------------------------
@@ -156,7 +170,7 @@
       chrObj = await service.getCharacteristic(chr);
       chrObj.addEventListener('characteristicvaluechanged', e => {
         const d = decode(e.target.value);
-        addSample(d.raw, d.value);
+        addSample(d.raw, d.value, d.label);
       });
       await chrObj.startNotifications();
       setBle('connected: ' + (device.name || 'device'), true);
