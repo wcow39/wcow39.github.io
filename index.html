@@ -220,12 +220,14 @@
     const batchId = session + '-' + Date.now() + '-' + Math.random().toString(36).slice(2,8);
     refresh();
     try {
+      const t0 = performance.now();
       const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // simple request: no CORS preflight
         body: JSON.stringify({ secret: $('secret').value.trim(), session, batchId, rows: batch })
       });
       const out = await res.json();
+      log(`Round trip: ${Math.round(performance.now() - t0)} ms`);
       if (!out.ok) throw new Error(out.error || 'server rejected batch');
       uploaded += batch.length;
       $('lastUp').textContent = new Date().toLocaleTimeString();
